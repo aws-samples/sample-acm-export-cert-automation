@@ -1,0 +1,111 @@
+Resources:
+  StateMachineb58df813:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      Definition:
+        StartAt: ExportCertOnly
+        States:
+          ExportCertOnly:
+            Type: Task
+            Resource: ${InvokeFunction_Resource_d74d08fe}
+            Next: CheckAndUpdateMappingAndSendSSM
+          CheckAndUpdateMappingAndSendSSM:
+            Type: Task
+            Resource: ${InvokeFunction_Resource_2ffc771f}
+            Next: WaitForStatus
+          WaitForStatus:
+            Type: Wait
+            Seconds: 15
+            Next: CheckCommandStatus
+          CheckCommandStatus:
+            Type: Task
+            Resource: ${InvokeFunction_Resource_6ee79c54}
+            Next: IsCommandComplete
+          IsCommandComplete:
+            Type: Choice
+            Choices:
+              - Variable: $.Status
+                StringEquals: Success
+                Next: SuccessState
+              - Variable: $.Status
+                StringEquals: Failed
+                Next: FailureState
+            Default: WaitForStatus
+          SuccessState:
+            Type: Succeed
+          FailureState:
+            Type: Fail
+            Error: SSMCommandFailed
+            Cause: The SSM command execution failed
+      DefinitionSubstitutions:
+        InvokeFunction_Resource_d74d08fe: arn:aws:lambda:us-east-1:1234567890123:function:acm-Export
+        InvokeFunction_Resource_2ffc771f: >-
+          arn:aws:lambda:us-east-1:1234567890123:function:checkAndUpdateMappingAndSendSSM
+        InvokeFunction_Resource_6ee79c54: arn:aws:lambda:us-east-1:1234567890123:function:checkCommandStatus
+      RoleArn:
+        Fn::GetAtt:
+          - Roleb096a319
+          - Arn
+      StateMachineName: StateMachineb58df813
+      StateMachineType: STANDARD
+      EncryptionConfiguration:
+        Type: AWS_OWNED_KEY
+      LoggingConfiguration:
+        Level: 'OFF'
+        IncludeExecutionData: false
+  Roleb096a319:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StepFunctions_IAM_ROLE_acmExportMachinecd4415c0
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      MaxSessionDuration: 3600
+  Policyf73b19d9:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: LambdaInvokeScopedAccessPolicy189e317d
+      RoleName:
+        Ref: Roleb096a319
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - arn:aws:lambda:us-east-1:1234567890123:function:acm-Export:*
+              - >-
+                arn:aws:lambda:us-east-1:1234567890123:function:checkCommandStatus:*
+              - >-
+                arn:aws:lambda:us-east-1:1234567890123:function:checkAndUpdateMappingAndSendSSM:*
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - arn:aws:lambda:us-east-1:1234567890123:function:acm-Export
+              - >-
+                arn:aws:lambda:us-east-1:1234567890123:function:checkCommandStatus
+              - >-
+                arn:aws:lambda:us-east-1:1234567890123:function:checkAndUpdateMappingAndSendSSM
+  Policy06187982:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: XRayAccessPolicy1032c575
+      RoleName:
+        Ref: Roleb096a319
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - xray:GetSamplingRules
+              - xray:GetSamplingTargets
+            Resource:
+              - '*'

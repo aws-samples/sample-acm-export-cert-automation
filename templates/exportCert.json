@@ -1,0 +1,7 @@
+{
+  "CertificateArn": "arn:aws:acm:us-east-1:704570343539:certificate/8106d6b2-f204-4354-8893-d49e311b3900",
+  "CertName": "academe",
+  "Passphrase": "1234",
+  "TargetTagKey": "env",
+  "TargetTagValue": "dev"
+}

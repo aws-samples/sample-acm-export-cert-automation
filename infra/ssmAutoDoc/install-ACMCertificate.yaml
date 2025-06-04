@@ -1,0 +1,50 @@
+schemaVersion: '2.2'
+description: 'Install SSL Certificate files on EC2 with dynamic file naming'
+parameters:
+  CertName:
+    type: String
+    description: 'Base name for the certificate files'
+  CertBase64:
+    type: String
+    description: 'Base64 encoded fullchain certificate'
+  KeyBase64:
+    type: String
+    description: 'Base64 encoded private key'
+  ChainBase64:
+    type: String
+    description: 'Base64 encoded chain certificate'
+mainSteps:
+  - action: aws:runShellScript
+    name: InstallCertificateFiles
+    inputs:
+      runCommand:
+        - |
+          #!/bin/bash
+          set -e
+          echo "Starting SSL Certificate installation..."
+
+          CERT_NAME="{{ CertName }}"
+
+          # Create necessary directories
+          mkdir -p /etc/ssl/certs /etc/ssl/private
+
+          # Write fullchain.pem
+          echo "{{ CertBase64 }}" | base64 -d > /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+
+          # Write privkey.pem
+          echo "{{ KeyBase64 }}" | base64 -d > /etc/ssl/private/${CERT_NAME}-privkey.pem
+
+          # Write chain.pem
+          echo "{{ ChainBase64 }}" | base64 -d > /etc/ssl/certs/${CERT_NAME}-chain.pem
+
+          # Set proper permissions
+          chmod 644 /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+          chmod 600 /etc/ssl/private/${CERT_NAME}-privkey.pem
+          chmod 644 /etc/ssl/certs/${CERT_NAME}-chain.pem
+
+          # Ensure ownership is correct
+          chown root:root /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+          chown root:root /etc/ssl/private/${CERT_NAME}-privkey.pem
+          chown root:root /etc/ssl/certs/${CERT_NAME}-chain.pem
+
+          echo "SSL Certificate installation completed for ${CERT_NAME}."
