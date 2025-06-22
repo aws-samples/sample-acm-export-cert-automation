@@ -1,18 +1,31 @@
 schemaVersion: '2.2'
-description: 'Install SSL Certificate files on EC2 with dynamic file naming'
+description: 'Install SSL Certificate files on EC2 using secure temp workspace and unwrapping private key'
 parameters:
   CertName:
     type: String
     description: 'Base name for the certificate files'
+
   CertBase64:
     type: String
     description: 'Base64 encoded fullchain certificate'
+
   KeyBase64:
     type: String
-    description: 'Base64 encoded private key'
+    description: 'Base64 encoded encrypted private key'
+
   ChainBase64:
     type: String
     description: 'Base64 encoded chain certificate'
+
+  PassphraseSecretName:
+    type: String
+    description: 'Secrets Manager secret name holding the passphrase'
+
+  SecretRegion:
+    type: String
+    default: "us-east-1"
+    description: 'Region where Secrets Manager secret is stored'
+
 mainSteps:
   - action: aws:runShellScript
     name: InstallCertificateFiles
@@ -21,30 +34,50 @@ mainSteps:
         - |
           #!/bin/bash
           set -e
-          echo "Starting SSL Certificate installation..."
+          set +x  # Disable echo for sensitive data
+
+          echo "Starting SSL certificate installation process..."
 
           CERT_NAME="{{ CertName }}"
+          REGION="{{ SecretRegion }}"
+          PASSPHRASE_SECRET="{{ PassphraseSecretName }}"
+          TMP_DIR="/tmp/${CERT_NAME}"
 
-          # Create necessary directories
-          mkdir -p /etc/ssl/certs /etc/ssl/private
+          mkdir -p "$TMP_DIR" /etc/ssl/certs /etc/ssl/private
 
-          # Write fullchain.pem
-          echo "{{ CertBase64 }}" | base64 -d > /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+          # Decode base64 input into /tmp
+          echo "{{ CertBase64 }}"  | base64 -d > "$TMP_DIR/fullchain.pem"
+          echo "{{ ChainBase64 }}" | base64 -d > "$TMP_DIR/chain.pem"
+          echo "{{ KeyBase64 }}"   | base64 -d > "$TMP_DIR/encrypted-key.pem"
 
-          # Write privkey.pem
-          echo "{{ KeyBase64 }}" | base64 -d > /etc/ssl/private/${CERT_NAME}-privkey.pem
+          # Retrieve passphrase from Secrets Manager
+          PASSPHRASE=$(aws secretsmanager get-secret-value \
+            --region "$REGION" \
+            --secret-id "$PASSPHRASE_SECRET" \
+            --query 'SecretString' \
+            --output text | sed -E 's/.*"passphrase"\s*:\s*"([^"]+)".*/\1/')
 
-          # Write chain.pem
-          echo "{{ ChainBase64 }}" | base64 -d > /etc/ssl/certs/${CERT_NAME}-chain.pem
+          # Decrypt private key
+          openssl rsa \
+            -in "$TMP_DIR/encrypted-key.pem" \
+            -out "$TMP_DIR/privkey.pem" \
+            -passin pass:"$PASSPHRASE"
 
-          # Set proper permissions
+          # Move to final destinations
+          mv "$TMP_DIR/fullchain.pem" /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+          mv "$TMP_DIR/chain.pem"     /etc/ssl/certs/${CERT_NAME}-chain.pem
+          mv "$TMP_DIR/privkey.pem"   /etc/ssl/private/${CERT_NAME}-privkey.pem
+
+          # Secure permissions
           chmod 644 /etc/ssl/certs/${CERT_NAME}-fullchain.pem
-          chmod 600 /etc/ssl/private/${CERT_NAME}-privkey.pem
           chmod 644 /etc/ssl/certs/${CERT_NAME}-chain.pem
+          chmod 600 /etc/ssl/private/${CERT_NAME}-privkey.pem
 
-          # Ensure ownership is correct
           chown root:root /etc/ssl/certs/${CERT_NAME}-fullchain.pem
-          chown root:root /etc/ssl/private/${CERT_NAME}-privkey.pem
           chown root:root /etc/ssl/certs/${CERT_NAME}-chain.pem
+          chown root:root /etc/ssl/private/${CERT_NAME}-privkey.pem
 
-          echo "SSL Certificate installation completed for ${CERT_NAME}."
+          # Cleanup temp directory
+          rm -rf "$TMP_DIR"
+
+          echo "Certificate and private key successfully installed."

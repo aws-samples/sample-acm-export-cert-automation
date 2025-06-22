@@ -1,0 +1,671 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ACM Certificate Export and Installation - Part 1'
+
+Parameters:
+  SSMDocumentName:
+    Type: String
+    Default: Install-ACMCertificate
+    Description: Name of the SSM document for certificate installation
+
+Resources:
+  # DynamoDB Table
+  CertTagMappingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: CertTagMapping
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: TagKeyValue
+          AttributeType: S
+        - AttributeName: CertificateArn#CertName
+          AttributeType: S
+      KeySchema:
+        - AttributeName: TagKeyValue
+          KeyType: HASH
+        - AttributeName: CertificateArn#CertName
+          KeyType: RANGE
+      Tags:
+        - Key: Purpose
+          Value: ACM-Certificate-Export
+
+  # Lambda Execution Role - Without Step Function reference
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ACMCertExportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - acm:ExportCertificate
+                  - acm:DescribeCertificate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt CertTagMappingTable.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:ListCommandInvocations
+                  - ssm:ListCommands
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:TagResource
+                Resource: 
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:acm-passphrase*'
+
+  # Lambda Functions
+  ACMExportLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: acm-Export
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import base64
+          import secrets
+          import json
+
+          acm_client = boto3.client('acm')
+          secrets_client = boto3.client('secretsmanager')
+
+          def generate_passphrase(length=32):
+              return secrets.token_urlsafe(length)
+
+          def lambda_handler(event, context):
+              cert_arn = event['CertificateArn']
+              cert_name = event['CertName']
+              tag_key = event['TargetTagKey']
+              tag_value = event['TargetTagValue']
+              
+              passphrase = generate_passphrase()
+              secret_name = f"acm-passphrase/{cert_name}"
+
+              # Create or update secret and its value
+              try:
+                  secrets_client.create_secret(
+                      Name=secret_name,
+                      SecretString=json.dumps({'passphrase': passphrase}),
+                      Tags=[{'Key': tag_key, 'Value': tag_value}]
+                  )
+              except secrets_client.exceptions.ResourceExistsException:
+                  secrets_client.put_secret_value(
+                      SecretId=secret_name,
+                      SecretString=json.dumps({'passphrase': passphrase})
+                  )
+                  # Ensure secret has the correct up-to-date tag
+                  secrets_client.tag_resource(
+                      SecretId=secret_name,
+                      Tags=[{'Key': tag_key, 'Value': tag_value}]
+                  )
+
+              # Export the certificate
+              response = acm_client.export_certificate(
+                  CertificateArn=cert_arn,
+                  Passphrase=passphrase.encode('utf-8')
+              )
+
+              encode = lambda data: base64.b64encode(data.encode('utf-8')).decode('utf-8')
+
+              return {
+                  'CertificateArn': cert_arn,
+                  'CertificateBase64': encode(response['Certificate']),
+                  'PrivateKeyBase64': encode(response['PrivateKey']),
+                  'CertificateChainBase64': encode(response['CertificateChain']),
+                  'CertName': cert_name,
+                  'TargetTagKey': tag_key,
+                  'TargetTagValue': tag_value,
+                  'PassphraseSecretName': secret_name
+              }
+
+  CheckAndUpdateMappingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: checkAndUpdateMappingAndSendSSM
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Environment:
+        Variables:
+          CERT_TAG_TABLE: !Ref CertTagMappingTable
+          SSM_DOCUMENT_NAME: !Ref SSMDocumentName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          acm_client = boto3.client('acm')
+          ssm_client = boto3.client('ssm')
+
+          def lambda_handler(event, context):
+              cert_arn = event['CertificateArn']
+              cert_name = event.get('CertName', 'default-cert')
+              tag_key = event.get('TargetTagKey', 'Environment')
+              tag_value = event.get('TargetTagValue', 'Dev')
+              secret_name = event['PassphraseSecretName']  # The name of the secret in Secrets Manager
+
+              now = datetime.utcnow().isoformat() + 'Z'
+              
+              table = dynamodb.Table('CertTagMapping')
+
+              # Get certificate expiration date
+              cert_description = acm_client.describe_certificate(CertificateArn=cert_arn)
+              cert_not_after = cert_description['Certificate']['NotAfter'].isoformat() + 'Z'
+
+              key = {
+                  'TagKeyValue': f"{tag_key}#{tag_value}",
+                  'CertificateArn#CertName': f"{cert_arn}#{cert_name}"
+              }
+
+              # Check if a record already exists
+              response = table.get_item(Key=key)
+              item = response.get('Item')
+
+              if item:
+                  # Update existing record
+                  table.update_item(
+                      Key=key,
+                      UpdateExpression="SET LastExportedDate = :led, CertExpiryDate = :ced, Passphrase = :ps",
+                      ExpressionAttributeValues={
+                          ':led': now,
+                          ':ced': cert_not_after,
+                          ':ps': secret_name
+                      }
+                  )
+              else:
+                  # Create a new record
+                  table.put_item(Item={
+                      'TagKeyValue': f"{tag_key}#{tag_value}",
+                      'CertificateArn#CertName': f"{cert_arn}#{cert_name}",
+                      'CertificateArn': cert_arn,
+                      'CertName': cert_name,
+                      'TargetTagKey': tag_key,
+                      'TargetTagValue': tag_value,
+                      'Passphrase': secret_name,
+                      'CertExpiryDate': cert_not_after,
+                      'LastExportedDate': now
+                  })
+
+              # Send certificate to EC2 via SSM
+              ssm_response = ssm_client.send_command(
+                  DocumentName=os.environ.get('SSM_DOCUMENT_NAME', 'Install-ACMCertificate'),
+                  Targets=[
+                      {
+                          'Key': f'tag:{tag_key}',
+                          'Values': [tag_value]
+                      }
+                  ],
+                  Parameters={
+                      'CertName': [cert_name],
+                      'CertBase64': [event['CertificateBase64']],
+                      'KeyBase64': [event['PrivateKeyBase64']],
+                      'ChainBase64': [event['CertificateChainBase64']],
+                      'PassphraseSecretName': [secret_name],
+                      'SecretRegion': [os.environ.get('AWS_REGION', 'us-east-1')]
+                  },
+                  Comment=f"Installing cert {cert_name} to EC2s tagged {tag_key}={tag_value}"
+              )
+
+              return {
+                  'CommandId': ssm_response['Command']['CommandId'],
+                  'CertificateArn': cert_arn
+              }
+
+  CheckCommandStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: checkCommandStatus
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          ssm_client = boto3.client('ssm')
+
+          def lambda_handler(event, context):
+              command_id = event['CommandId']
+
+              command = ssm_client.list_commands(CommandId=command_id)
+              if command['Commands']:
+                  status = command['Commands'][0]['Status']
+                  return {'Status': status}
+
+              # Aggregate statuses
+              statuses = [inv['Status'] for inv in response['CommandInvocations']]
+
+              if all(s in ['Success'] for s in statuses):
+                  return {'Status': 'Success'}
+
+              if any(s in ['Failed', 'Cancelled', 'TimedOut'] for s in statuses):
+                  return {'Status': 'Failed'}
+
+              return {'Status': 'InProgress'}
+
+
+  # Step Function Execution Role
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionLambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ACMExportLambda.Arn
+                  - !GetAtt CheckAndUpdateMappingLambda.Arn
+                  - !GetAtt CheckCommandStatusLambda.Arn
+
+  # Step Function State Machine
+  ACMExportStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: 
+      - ACMExportLambda
+      - CheckAndUpdateMappingLambda
+      - CheckCommandStatusLambda
+      - StepFunctionExecutionRole
+    Properties:
+      StateMachineName: acmExportMachine
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "ExportCertOnly",
+          "States": {
+            "ExportCertOnly": {
+              "Type": "Task",
+              "Resource": "${ACMExportLambda.Arn}",
+              "Next": "CheckAndUpdateMappingAndSendSSM"
+            },
+            "CheckAndUpdateMappingAndSendSSM": {
+              "Type": "Task",
+              "Resource": "${CheckAndUpdateMappingLambda.Arn}",
+              "Next": "WaitForStatus"
+            },
+            "WaitForStatus": {
+              "Type": "Wait",
+              "Seconds": 15,
+              "Next": "CheckCommandStatus"
+            },
+            "CheckCommandStatus": {
+              "Type": "Task",
+              "Resource": "${CheckCommandStatusLambda.Arn}",
+              "Next": "IsCommandComplete"
+            },
+            "IsCommandComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Status",
+                  "StringEquals": "Success",
+                  "Next": "SuccessState"
+                },
+                {
+                  "Variable": "$.Status",
+                  "StringEquals": "Failed",
+                  "Next": "FailureState"
+                }
+              ],
+              "Default": "WaitForStatus"
+            },
+            "SuccessState": {
+              "Type": "Succeed"
+            },
+            "FailureState": {
+              "Type": "Fail",
+              "Error": "SSMCommandFailed",
+              "Cause": "The SSM command execution failed"
+            }
+          }
+        }
+
+  # Lambda permission to start Step Function
+  LambdaStepFunctionPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: ACMExportStateMachine
+    Properties:
+      PolicyName: LambdaStepFunctionPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !Ref ACMExportStateMachine
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  # API Gateway Role
+  APIGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+
+  # API Gateway
+  ACMExportAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ACMExportAPI
+      Description: API for ACM Certificate Export and Installation
+
+  ACMExportResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ACMExportAPI
+      ParentId: !GetAtt ACMExportAPI.RootResourceId
+      PathPart: export-cert
+
+  # API Gateway permission to invoke Step Function
+  APIGatewayStepFunctionPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn: ACMExportStateMachine
+    Properties:
+      PolicyName: APIGatewayStepFunctionPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !Ref ACMExportStateMachine
+      Roles:
+        - !Ref APIGatewayRole
+
+  ACMExportMethod:
+    Type: AWS::ApiGateway::Method
+    DependsOn: 
+      - APIGatewayRole
+      - APIGatewayStepFunctionPolicy
+      - ACMExportStateMachine
+    Properties:
+      RestApiId: !Ref ACMExportAPI
+      ResourceId: !Ref ACMExportResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM  # Using AWS IAM authentication
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:states:action/StartExecution
+        Credentials: !GetAtt APIGatewayRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "input": "$util.escapeJavaScript($input.json('$'))",
+              "stateMachineArn": "${ACMExportStateMachine}"
+            }
+        IntegrationResponses:
+          - StatusCode: 200
+      MethodResponses:
+        - StatusCode: 200
+
+  APIGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ACMExportMethod
+    Properties:
+      RestApiId: !Ref ACMExportAPI
+      StageName: prod
+
+  # SSM Document for Certificate Installation
+  InstallACMCertificateDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Ref SSMDocumentName
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: 'Install SSL Certificate files on EC2 using secure temp workspace and unwrapping private key'
+        parameters:
+          CertName:
+            type: String
+            description: 'Base name for the certificate files'
+          CertBase64:
+            type: String
+            description: 'Base64 encoded fullchain certificate'
+          KeyBase64:
+            type: String
+            description: 'Base64 encoded encrypted private key'
+          ChainBase64:
+            type: String
+            description: 'Base64 encoded chain certificate'
+          PassphraseSecretName:
+            type: String
+            description: 'Secrets Manager secret name holding the passphrase'
+          SecretRegion:
+            type: String
+            default: "us-east-1"
+            description: 'Region where Secrets Manager secret is stored'
+        mainSteps:
+          - action: aws:runShellScript
+            name: InstallCertificateFiles
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  set -e
+                  set +x  # Disable echo for sensitive data
+
+                  echo "Starting SSL certificate installation process..."
+
+                  CERT_NAME="{{ CertName }}"
+                  REGION="{{ SecretRegion }}"
+                  PASSPHRASE_SECRET="{{ PassphraseSecretName }}"
+                  TMP_DIR="/tmp/${CERT_NAME}"
+
+                  mkdir -p "$TMP_DIR" /etc/ssl/certs /etc/ssl/private
+
+                  # Decode base64 input into /tmp
+                  echo "{{ CertBase64 }}"  | base64 -d > "$TMP_DIR/fullchain.pem"
+                  echo "{{ ChainBase64 }}" | base64 -d > "$TMP_DIR/chain.pem"
+                  echo "{{ KeyBase64 }}"   | base64 -d > "$TMP_DIR/encrypted-key.pem"
+
+                  # Retrieve passphrase from Secrets Manager
+                  PASSPHRASE=$(aws secretsmanager get-secret-value \
+                    --region "$REGION" \
+                    --secret-id "$PASSPHRASE_SECRET" \
+                    --query 'SecretString' \
+                    --output text | sed -E 's/.*"passphrase"\s*:\s*"([^"]+)".*/\1/')
+
+                  # Decrypt private key
+                  openssl rsa \
+                    -in "$TMP_DIR/encrypted-key.pem" \
+                    -out "$TMP_DIR/privkey.pem" \
+                    -passin pass:"$PASSPHRASE"
+
+                  # Move to final destinations
+                  mv "$TMP_DIR/fullchain.pem" /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+                  mv "$TMP_DIR/chain.pem"     /etc/ssl/certs/${CERT_NAME}-chain.pem
+                  mv "$TMP_DIR/privkey.pem"   /etc/ssl/private/${CERT_NAME}-privkey.pem
+
+                  # Secure permissions
+                  chmod 644 /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+                  chmod 644 /etc/ssl/certs/${CERT_NAME}-chain.pem
+                  chmod 600 /etc/ssl/private/${CERT_NAME}-privkey.pem
+
+                  chown root:root /etc/ssl/certs/${CERT_NAME}-fullchain.pem
+                  chown root:root /etc/ssl/certs/${CERT_NAME}-chain.pem
+                  chown root:root /etc/ssl/private/${CERT_NAME}-privkey.pem
+
+                  # Cleanup temp directory
+                  rm -rf "$TMP_DIR"
+
+                  echo "Certificate and private key successfully installed."
+
+  # Certificate Renewal Lambda Role
+  RenewalLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RenewalLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: !GetAtt CertTagMappingTable.Arn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref ACMExportStateMachine
+
+  # Certificate Renewal Lambda Function
+  RenewACMCertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: renewACMCert
+      Handler: index.lambda_handler
+      Role: !GetAtt RenewalLambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Environment:
+        Variables:
+          CERT_TAG_TABLE: !Ref CertTagMappingTable
+          STATE_MACHINE_ARN: !Ref ACMExportStateMachine
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from boto3.dynamodb.conditions import Attr
+
+          dynamodb = boto3.resource('dynamodb')
+          stepfunctions = boto3.client('stepfunctions')
+
+          CERT_TAG_TABLE = os.environ['CERT_TAG_TABLE']
+          STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
+
+          def lambda_handler(event, context):
+              cert_arn = event['resources'][0]  # From ACM Certificate Available event
+
+              table = dynamodb.Table(CERT_TAG_TABLE)
+
+              # Scan for all rows with this cert ARN
+              response = table.scan(
+                  FilterExpression=Attr('CertificateArn#CertName').begins_with(f"{cert_arn}#")
+              )
+
+              items = response.get('Items', [])
+
+              if not items:
+                  raise Exception(f"CertificateArn {cert_arn} not found in CertTagMapping table")
+
+              # Trigger Step Function for each cert-tag mapping
+              for item in items:
+                  step_input = {
+                      "CertificateArn": cert_arn,
+                      "CertName": item.get("CertName"),
+                      "Passphrase": item.get("Passphrase"),
+                      "TargetTagKey": item.get("TargetTagKey"),
+                      "TargetTagValue": item.get("TargetTagValue")
+                  }
+
+                  stepfunctions.start_execution(
+                      stateMachineArn=STATE_MACHINE_ARN,
+                      input=json.dumps(step_input)
+                  )
+
+              return {
+                  "status": "Triggered Step Function for renewals",
+                  "certArn": cert_arn,
+                  "executionsStarted": len(items)
+              }
+
+  # EventBridge Rule for ACM Certificate Renewal
+  ACMCertificateRenewalRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: acm-certificate-renewal-rule
+      Description: "Rule to capture ACM certificate renewal events"
+      EventPattern:
+        source:
+          - "aws.acm"
+        detail-type:
+          - "ACM Certificate Available"
+        detail:
+          Action:
+            - "RENEWAL"
+          CertificateType:
+            - "AMAZON_ISSUED"
+          Exportable:
+            - true
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RenewACMCertLambda.Arn
+          Id: "RenewACMCertTarget"
+
+  # Lambda Permission for EventBridge
+  RenewalLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RenewACMCertLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ACMCertificateRenewalRule.Arn
+
+
+Outputs:
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table for certificate mapping
+    Value: !Ref CertTagMappingTable
+  
+  StateMachineArn:
+    Description: ARN of the Step Function state machine
+    Value: !Ref ACMExportStateMachine
+  
+  APIEndpoint:
+    Description: API Gateway endpoint URL for certificate export
+    Value: !Sub https://${ACMExportAPI}.execute-api.${AWS::Region}.amazonaws.com/prod/export-cert

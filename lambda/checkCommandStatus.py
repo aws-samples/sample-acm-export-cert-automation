@@ -1,5 +1,4 @@
 import boto3
-import json
 
 ssm_client = boto3.client('ssm')
 
@@ -11,15 +10,19 @@ def lambda_handler(event, context):
         CommandId=command_id,
         Details=False  # We only need Status field
     )
-    command = ssm_client.list_commands(CommandId=command_id)
-    if command['Commands']:
-        status = command['Commands'][0]['Status']
-        return {'Status': status}
 
-    if all(s in ['Success'] for s in status):
+    invocations = response.get('CommandInvocations', [])
+
+    if not invocations:
+        return {'Status': 'Pending'}
+
+    # Aggregate statuses
+    statuses = [inv['Status'] for inv in invocations]
+
+    if all(s in ['Success'] for s in statuses):
         return {'Status': 'Success'}
 
-    if any(s in ['Failed', 'Cancelled', 'TimedOut'] for s in status):
+    if any(s in ['Failed', 'Cancelled', 'TimedOut'] for s in statuses):
         return {'Status': 'Failed'}
 
     return {'Status': 'InProgress'}
