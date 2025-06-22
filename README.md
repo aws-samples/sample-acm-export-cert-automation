@@ -1,7 +1,5 @@
 # ACM Certificate Export and Renewal Automation
 
-![Sample Project](https://img.shields.io/badge/Project%20Type-Sample-blue) ![AWS](https://img.shields.io/badge/AWS-ACM%20|%20Lambda%20|%20Step%20Functions-orange)
-
 > **Note:** This is a sample project for demonstration and learning purposes.
 
 This project demonstrates how to automate the process of exporting Amazon Certificate Manager (ACM) certificates and installing them on EC2 instances and on-premises servers. It also showcases automated certificate renewal, creating a seamless, event-driven workflow that requires minimal manual intervention.
@@ -44,11 +42,31 @@ The solution consists of two main parts:
 7. **Certificate Installation**: Target EC2 instances retrieve the passphrase from Secrets Manager, decrypt the private key, and install the certificate files
 8. **Automatic Renewal**: When certificates are renewed in ACM, the system automatically detects the event and repeats the process
 
-### Certificate Export and Installation Flow
-![Certificate Export and Installation Flow](diagram/EC2Automation-ACM%20certificate%20export%20cert.drawio.png)
+### On-Demand Certificate Deployment Flow
+![On-Demand Certificate Deployment Flow](diagram/EC2Automation-ACM%20certificate%20export%20cert.drawio.png)
 
-### Certificate Renewal Flow
-![Certificate Renewal Flow](diagram/EC2Automation-Certificate%20renewal.drawio.png)
+1. **Initiate Certificate Issuance**: The user triggers the certificate issuance process, ensuring that the certificate is in the "issued" state before proceeding.
+2. **API Triggers Step Function**: An API call triggers a Step Function to begin the certificate installation cycle.
+3. **Invoke ACM Export Lambda**: The Step Function calls the first step, invoking the acm-export Lambda, which generates a passphrase and securely stores it in AWS Secrets Manager.
+4. **Export Certificate**: The acm-export Lambda uses the generated passphrase to export the ACM certificate, completing the first step of the export process.
+5. **Invoke SSM Run Lambda**: The Step Function invokes the ssm-run Lambda, passing the secret name, passphrase, encrypted private key, and public key to the next step in the cycle, as provided by the acm-export Lambda.
+6. **Update DynamoDB**: The ssm-run Lambda updates the DynamoDB table with relevant details, including the certificate ARN, certificate name, tag values, issuance date, and expiration date.
+7. **Execute SSM Automation Document**: The ssm-run Lambda triggers an SSM automation document, running commands to install the certificate by passing the public key, encrypted private key, and the secret alias of the passphrase.
+8. **Install Certificate on EC2 Instances**: The SSM automation document executes the installation of the certificates and the private key on the EC2 instances, while also validating the passphrase. (Customer can enhance these steps as they use the sample)
+9. **Wait for SSM Deployment Completion**: The Lambda status check waits for SSM to complete the certificate deployment across all EC2 instances before concluding the Step Function.
+
+### Automated Certificate Renewal Flow
+![Automated Certificate Renewal Flow](diagram/EC2Automation-Certificate%20renewal.drawio.png)
+
+1. **EventBridge Triggers Certificate Renewal**: An EventBridge event is triggered, confirming that the certificate has been renewed.
+2. **Invoke Renewal Lambda**: The EventBridge event invokes the renew-acm Lambda function, which initiates the renewal process.
+3. **Invoke ACM Export Lambda**: The Step Function invokes the acm-export Lambda, which generates a passphrase and securely stores it in AWS Secrets Manager.
+4. **Export Renewed Certificate**: The acm-export Lambda uses the generated passphrase to export the renewed ACM certificate, completing the export process.
+5. **Invoke SSM Run Lambda**: The Step Function invokes the ssm-run Lambda, passing the secret name, passphrase, encrypted private key, and public key to the next step in the cycle, as provided by the acm-export Lambda.
+6. **Update DynamoDB**: The ssm-run Lambda updates the DynamoDB table with relevant details, including the certificate ARN, certificate name, tag values, issuance date, and expiration date for the renewed certificate.
+7. **Execute SSM Automation Document**: The ssm-run Lambda triggers an SSM automation document, running commands to install the renewed certificate by passing the public key, encrypted private key, and the secret alias of the passphrase.
+8. **Install Certificate on EC2 Instances**: The SSM automation document executes the installation of the renewed certificate and the private key on the EC2 instances, while also validating the passphrase.
+9. **Wait for SSM Deployment Completion**: The Lambda status check waits for SSM to complete the certificate deployment across all EC2 instances before concluding the Step Function.
 
 ## 🧩 Architecture Components
 
