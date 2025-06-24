@@ -29,7 +29,6 @@ def lambda_handler(event, context):
         step_input = {
             "CertificateArn": cert_arn,
             "CertName": item.get("CertName"),
-            "Passphrase": item.get("Passphrase"),
             "TargetTagKey": item.get("TargetTagKey"),
             "TargetTagValue": item.get("TargetTagValue")
         }

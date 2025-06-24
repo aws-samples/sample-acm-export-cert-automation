@@ -2,7 +2,7 @@
 
 > **Note:** This is a sample project for demonstration and learning purposes.
 
-This project demonstrates how to automate the process of exporting Amazon Certificate Manager (ACM) certificates and installing them on EC2 instances and on-premises servers. It also showcases automated certificate renewal, creating a seamless, event-driven workflow that requires minimal manual intervention.
+This project demonstrates how to automate the process of exporting Amazon Certificate Manager (ACM) certificates and installing them on EC2 instances and on-premises servers. It also showcases automated certificate renewal, creating a seamless, event-driven workflow that requires minimal manual intervention. The solution is designed to be flexible and customizable for different operating systems and application types.
 
 ## 🎯 Learning Objectives
 
@@ -19,10 +19,18 @@ This project demonstrates how to automate the process of exporting Amazon Certif
 - [On-Demand Certificate Deployment](#-on-demand-certificate-deployment)
 - [Automated Certificate Renewal](#-automated-certificate-renewal)
 - [Step Function Details](#-step-function-details)
+- [Prerequisites](#-prerequisites)
 - [Setup Instructions](#️-setup-instructions)
 - [Testing the Solution](#-testing-the-solution)
 - [Quickstart with CloudFormation](#-quickstart-with-cloudformation)
+- [Important Notes](#-important-notes)
+- [Customization Options](#-customization-options)
+- [EC2 IAM Policy Requirements](#-ec2-iam-policy-requirements)
+- [SSM Certificate Installation Flow](#-ssm-certificate-installation-flow)
+- [Successful Execution Flow](#-successful-execution-flow)
 - [Monitoring and Notifications](#-monitoring-and-notifications)
+- [Limitations and Considerations](#️-limitations-and-considerations)
+- [Further Reading](#-further-reading)
 
 ## 🏗️ Solution Overview
 
@@ -237,7 +245,6 @@ Start
 | SSM automation                  | Consistent installation across environments      |
 | Step Function orchestration     | Reliable execution with visibility and logging   |
 
-
 ## ✅ Prerequisites
 
 Before setting up this solution, ensure you have:
@@ -366,7 +373,7 @@ Deploy the solution quickly using the provided CloudFormation template:
 
 6. **Monitor the execution in the Step Functions console to see the certificate export and installation progress.**
 
-## Important Notes  
+## 📝 Important Notes  
 
   * Target EC2 instances must be running Linux and have SSM Agent installed
 
@@ -378,7 +385,23 @@ Deploy the solution quickly using the provided CloudFormation template:
   
   * You can customize the installation paths by modifying the SSM document
 
-## EC2 IAM Policy Requirements
+## 🔧 Customization Options
+
+The solution can be extended to support different operating systems and application types by:
+
+1. **Customizable SSM Documents**: The Lambda function can be modified to use different SSM documents based on the target environment.
+
+2. **OS-Specific Installation**: Support for various operating systems (Windows, different Linux distributions) by specifying an `OSType` parameter.
+
+3. **Application-Specific Configuration**: Adapt certificate installation for different application types (web servers, databases, custom applications) through an `ApplicationType` parameter.
+
+4. **Custom Installation Paths**: Allow specification of custom certificate installation paths and permissions.
+
+5. **Post-Installation Actions**: Enable application-specific actions after certificate installation, such as service restarts.
+
+This flexibility can be implemented by extending the payload structure and modifying the Lambda function to accept and process these additional parameters.
+
+## 🔒 EC2 IAM Policy Requirements
 
 EC2 instances that receive certificates must have an IAM role with the following policy to enable Attribute-Based Access Control (ABAC) for accessing certificate passphrases:
 
@@ -404,12 +427,14 @@ EC2 instances that receive certificates must have an IAM role with the following
 }
 ```
 
-This ABAC policy ensures that:
-- EC2 instances can only access secrets with matching environment tags
-- The SSM automation can retrieve the passphrase to decrypt the private key during installation
-- Security is maintained through tag-based access control
+> **Important:** The IAM role assigned to the EC2 instance (not the EC2 instance itself) must have the same tags as the secret for ABAC to work properly. In the policy above, `${aws:PrincipalTag/env}` refers to the tag on the IAM role, not the EC2 instance. During execution, the system validates that the role's tag matches the secret's tag to allow access.
 
-## SSM Certificate Installation Flow
+This ABAC policy ensures that:
+- EC2 instances can only access secrets when their IAM role has matching environment tags
+- The SSM automation can retrieve the passphrase to decrypt the private key during installation
+- Security is maintained through role-based tag access control
+
+## 🔄 SSM Certificate Installation Flow
 
 The SSM document (`Install-ACMCertificate`) performs the following steps:
 
@@ -440,7 +465,7 @@ The SSM document (`Install-ACMCertificate`) performs the following steps:
 This process can be customized by modifying the SSM document to use different paths or permissions as needed for your specific application requirements.
 
 
-## Successful Execution Flow
+## 📊 Successful Execution Flow
 ![Sucessful step fuction execution flow](diagram/sample-step-fuction-excution.png)
 
 ## 🔔 Monitoring and Notifications

@@ -33,7 +33,7 @@ def lambda_handler(event, context):
         # Update existing record
         table.update_item(
             Key=key,
-            UpdateExpression="SET LastExportedDate = :led, CertExpiryDate = :ced, Passphrase = :ps",
+            UpdateExpression="SET LastExportedDate = :led, CertExpiryDate = :ced, PassphraseSecretName = :ps",
             ExpressionAttributeValues={
                 ':led': now,
                 ':ced': cert_not_after,
@@ -49,7 +49,7 @@ def lambda_handler(event, context):
             'CertName': cert_name,
             'TargetTagKey': tag_key,
             'TargetTagValue': tag_value,
-            'Passphrase': secret_name,
+            'PassphraseSecretName': secret_name,
             'CertExpiryDate': cert_not_after,
             'LastExportedDate': now
         })
